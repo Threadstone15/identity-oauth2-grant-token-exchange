@@ -818,7 +818,7 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
         for (RequestParameter param : requestParameters) {
             if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
                 String[] values = param.getValue();
-                if (values != null && values.length > 0) {
+                if (values != null) {
                     // Add all values from this audience parameter
                     for (String value : values) {
                         if (value != null && !value.trim().isEmpty()) {
