@@ -54,6 +54,7 @@ import org.wso2.carbon.user.core.listener.UserOperationEventListener;
 import org.wso2.carbon.utils.DiagnosticLog;
 import org.wso2.carbon.utils.multitenancy.MultitenantConstants;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -123,18 +124,47 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
 
         String requestedAudience = null;
         RequestParameter[] params = tokReqMsgCtx.getOauth2AccessTokenReqDTO().getRequestParameters();
-        Map<String, String> requestParams = Arrays.stream(params).collect(Collectors.toMap(RequestParameter::getKey,
-                requestParam -> requestParam.getValue()[0]));
+
+        // Create a map for single-value parameters (note: this loses repeated parameters like audience)
+        // We'll extract audience separately to handle multiple values
+        Map<String, String> requestParams = Arrays.stream(params)
+                .filter(param -> !Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey()))
+                .collect(Collectors.toMap(RequestParameter::getKey,
+                        requestParam -> requestParam.getValue()[0]));
+
         String subjectTokenType = requestParams.get(Constants.TokenExchangeConstants.SUBJECT_TOKEN_TYPE);
 
         if (requestParams.get(Constants.TokenExchangeConstants.REQUESTED_TOKEN_TYPE) != null) {
             requestedTokenType = requestParams.get(Constants.TokenExchangeConstants.REQUESTED_TOKEN_TYPE);
         }
-        if (requestParams.get(Constants.TokenExchangeConstants.AUDIENCE) != null) {
-            requestedAudience = requestParams.get(Constants.TokenExchangeConstants.AUDIENCE);
-        }
 
         String tenantDomain = getTenantDomain(tokReqMsgCtx);
+
+        // Extract and validate requested audiences for access token requests
+        // This must happen BEFORE other validations to set audiences in the context
+        if (Constants.TokenExchangeConstants.ACCESS_TOKEN_TYPE.equals(requestedTokenType)) {
+            List<String> requestedAudiences = extractRequestedAudiences(params);
+            if (requestedAudiences != null && !requestedAudiences.isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[TOKEN-EXCHANGE] Requested token type is access_token, processing audience validation");
+                }
+                validateAndSetRequestedAudiences(tokReqMsgCtx, requestedAudiences);
+            }
+        } else {
+            // For backward compatibility, get the first audience value for non-access-token requests
+            if (params != null) {
+                for (RequestParameter param : params) {
+                    if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
+                        String[] values = param.getValue();
+                        if (values != null && values.length > 0) {
+                            requestedAudience = values[0];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         if (isImpersonationRequest(requestParams)) {
             validateSubjectToken(tokReqMsgCtx, requestParams, tenantDomain);
             validateActorToken(tokReqMsgCtx, requestParams, tenantDomain);
@@ -764,5 +794,129 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
         checkExpirationTime(claimsSet.getExpirationTime(), currentTimeInMillis, timeStampSkewMillis);
         checkNotBeforeTime(claimsSet.getNotBeforeTime(), currentTimeInMillis, timeStampSkewMillis);
         validateIssuedAtTime(claimsSet.getIssueTime(), currentTimeInMillis, timeStampSkewMillis, validityPeriodInMin);
+    }
+
+    /**
+     * Extracts all audience values from request parameters.
+     * Supports multiple repeated "audience" parameters (e.g., audience=abcd&audience=pqrs).
+     *
+     * @param requestParameters Array of request parameters
+     * @return List of audience values, or null if no audience parameter found
+     */
+    private List<String> extractRequestedAudiences(RequestParameter[] requestParameters) {
+
+        if (requestParameters == null || requestParameters.length == 0) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] No request parameters available to extract audiences");
+            }
+            return null;
+        }
+
+        List<String> audiences = new ArrayList<>();
+
+        // Look for all "audience" parameters (can be repeated multiple times)
+        for (RequestParameter param : requestParameters) {
+            if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
+                String[] values = param.getValue();
+                if (values != null && values.length > 0) {
+                    // Add all values from this audience parameter
+                    for (String value : values) {
+                        if (value != null && !value.trim().isEmpty()) {
+                            audiences.add(value.trim());
+                            if (log.isDebugEnabled()) {
+                                log.debug("[TOKEN-EXCHANGE] Found requested audience: '" + value.trim() + "'");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!audiences.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] Extracted " + audiences.size() +
+                          " requested audience(s): " + audiences);
+            }
+            return audiences;
+        }
+
+        if (log.isDebugEnabled()) {
+            log.debug("[TOKEN-EXCHANGE] No audience parameter found in request");
+        }
+        return null;
+    }
+
+    /**
+     * Validates that all requested audiences are registered for the application,
+     * and sets the validated audiences (client_id + requested audiences) in the token context.
+     *
+     * @param tokReqMsgCtx        OAuth token request message context
+     * @param requestedAudiences  List of audiences requested in the token exchange request
+     * @throws IdentityOAuth2Exception if validation fails or requested audiences are not registered
+     */
+    private void validateAndSetRequestedAudiences(OAuthTokenReqMessageContext tokReqMsgCtx,
+                                                   List<String> requestedAudiences) throws IdentityOAuth2Exception {
+
+        String clientId = tokReqMsgCtx.getOauth2AccessTokenReqDTO().getClientId();
+
+        if (log.isDebugEnabled()) {
+            log.debug("[TOKEN-EXCHANGE] Validating requested audiences: " + requestedAudiences +
+                      " for client: " + clientId);
+        }
+
+        try {
+            // Get the registered OIDC audiences for this application
+            org.wso2.carbon.identity.oauth.dao.OAuthAppDO oAuthAppDO =
+                OAuth2Util.getAppInformationByClientId(clientId);
+            List<String> registeredAudiences = OAuth2Util.getOIDCAudience(clientId, oAuthAppDO);
+
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] Registered audiences for client " + clientId + ": " +
+                          registeredAudiences);
+            }
+
+            // Validate that all requested audiences are in the registered list
+            List<String> invalidAudiences = new ArrayList<>();
+            for (String requestedAudience : requestedAudiences) {
+                if (!registeredAudiences.contains(requestedAudience)) {
+                    invalidAudiences.add(requestedAudience);
+                }
+            }
+
+            if (!invalidAudiences.isEmpty()) {
+                String errorMsg = "Requested audience(s) " + invalidAudiences +
+                                  " are not registered for the application. Registered audiences: " +
+                                  registeredAudiences;
+                if (log.isDebugEnabled()) {
+                    log.debug("[TOKEN-EXCHANGE] Audience validation failed: " + errorMsg);
+                }
+                // Use invalid_target error code as per RFC 8693 (OAuth 2.0 Token Exchange)
+                // This will return a 400 Bad Request
+                handleException(Constants.TokenExchangeConstants.INVALID_TARGET, errorMsg);
+            }
+
+            // All requested audiences are valid, now set them in the token context
+            // Always include client_id first (OIDC spec requirement)
+            List<String> finalAudiences = new ArrayList<>();
+            if (!requestedAudiences.contains(clientId)) {
+                finalAudiences.add(clientId);
+            }
+            finalAudiences.addAll(requestedAudiences);
+
+            tokReqMsgCtx.setAudiences(finalAudiences);
+
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] Successfully set audiences in token context: " + finalAudiences);
+            }
+
+        } catch (IdentityOAuth2Exception e) {
+            // Re-throw IdentityOAuth2Exception as-is (already has correct error code)
+            throw e;
+        } catch (Exception e) {
+            // Only catch unexpected exceptions and convert to server error
+            String errorMsg = "Unexpected error while validating requested audiences for client: " + clientId;
+            log.error(errorMsg, e);
+            handleException(OAuth2ErrorCodes.SERVER_ERROR, errorMsg);
+        }
     }
 }
