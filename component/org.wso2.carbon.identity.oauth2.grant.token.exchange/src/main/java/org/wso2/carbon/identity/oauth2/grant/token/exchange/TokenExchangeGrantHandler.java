@@ -858,7 +858,6 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
                                                    List<String> requestedAudiences) throws IdentityOAuth2Exception {
 
         String clientId = tokReqMsgCtx.getOauth2AccessTokenReqDTO().getClientId();
-        String tenantDomain = getTenantDomain(tokReqMsgCtx);
 
         if (log.isDebugEnabled()) {
             log.debug("[TOKEN-EXCHANGE] Validating requested audiences: " + requestedAudiences +
@@ -868,7 +867,7 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
         try {
             // Get the registered OIDC audiences for this application
             org.wso2.carbon.identity.oauth.dao.OAuthAppDO oAuthAppDO =
-                OAuth2Util.getAppInformationByClientId(clientId, tenantDomain);
+                    OAuth2Util.getAppInformationByClientId(clientId);
             List<String> registeredAudiences = OAuth2Util.getOIDCAudience(clientId, oAuthAppDO);
 
             if (log.isDebugEnabled()) {
