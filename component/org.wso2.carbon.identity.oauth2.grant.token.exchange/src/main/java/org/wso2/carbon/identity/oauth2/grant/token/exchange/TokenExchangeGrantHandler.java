@@ -140,26 +140,28 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
 
         String tenantDomain = getTenantDomain(tokReqMsgCtx);
 
-        // Extract and validate requested audiences for access token requests
+        // Extract and validate requested audiences for all token types
         // This must happen BEFORE other validations to set audiences in the context
-        if (Constants.TokenExchangeConstants.ACCESS_TOKEN_TYPE.equals(requestedTokenType)) {
-            List<String> requestedAudiences = extractRequestedAudiences(params);
-            if (requestedAudiences != null && !requestedAudiences.isEmpty()) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[TOKEN-EXCHANGE] Requested token type is access_token, processing audience validation");
-                }
-                validateAndSetRequestedAudiences(tokReqMsgCtx, requestedAudiences);
+        List<String> requestedAudiences = extractRequestedAudiences(params);
+        if (requestedAudiences != null && !requestedAudiences.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] Processing audience validation for requested audiences: " +
+                          requestedAudiences);
+            }
+            validateAndSetRequestedAudiences(tokReqMsgCtx, requestedAudiences);
+
+            // For backward compatibility with non-access-token requests, set the first audience value
+            if (!Constants.TokenExchangeConstants.ACCESS_TOKEN_TYPE.equals(requestedTokenType)) {
+                requestedAudience = requestedAudiences.get(0);
             }
         } else {
-            // For backward compatibility, get the first audience value for non-access-token requests
-            if (params != null) {
-                for (RequestParameter param : params) {
-                    if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
-                        String[] values = param.getValue();
-                        if (values != null && values.length > 0) {
-                            requestedAudience = values[0];
-                            break;
-                        }
+            // Fallback: For backward compatibility, get the first audience value if extractRequestedAudiences returns null
+            for (RequestParameter param : params) {
+                if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
+                    String[] values = param.getValue();
+                    if (values != null && values.length > 0) {
+                        requestedAudience = values[0];
+                        break;
                     }
                 }
             }
@@ -500,6 +502,20 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
     @Override
     public OAuth2AccessTokenRespDTO issue(OAuthTokenReqMessageContext tokReqMsgCtx) throws IdentityOAuth2Exception {
 
+        // Check if we have requested audiences stored from validation
+        @SuppressWarnings("unchecked")
+        List<String> requestedAudiences = (List<String>) tokReqMsgCtx.getProperty("TOKEN_EXCHANGE_REQUESTED_AUDIENCES");
+
+        if (requestedAudiences != null && !requestedAudiences.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TOKEN-EXCHANGE] Using requested audiences for token generation: " + requestedAudiences);
+            }
+
+            // Set the audiences again just before token generation to ensure they're used
+            String[] audiencesArray = requestedAudiences.toArray(new String[requestedAudiences.size()]);
+            tokReqMsgCtx.setAudiences(Arrays.asList(audiencesArray));
+        }
+
         OAuth2AccessTokenRespDTO tokenRespDTO = super.issue(tokReqMsgCtx);
         AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
         Map<ClaimMapping, String> userAttributes = user.getUserAttributes();
@@ -507,6 +523,7 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
             ClaimsUtil.addUserAttributesToCache(tokenRespDTO, tokReqMsgCtx, userAttributes);
         }
         tokenRespDTO.addParameter(Constants.TokenExchangeConstants.ISSUED_TOKEN_TYPE, requestedTokenType);
+
         return tokenRespDTO;
     }
 
@@ -812,19 +829,42 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
             return null;
         }
 
+        // Debug: Log ALL parameters to understand the structure
+        if (log.isDebugEnabled()) {
+            log.debug("[TOKEN-EXCHANGE] Total request parameters: " + requestParameters.length);
+            for (int i = 0; i < requestParameters.length; i++) {
+                RequestParameter param = requestParameters[i];
+                String[] values = param.getValue();
+                log.debug("[TOKEN-EXCHANGE] Param[" + i + "]: key='" + param.getKey() +
+                          "', values=" + (values != null ? Arrays.toString(values) : "null"));
+            }
+        }
+
         List<String> audiences = new ArrayList<>();
 
         // Look for all "audience" parameters (can be repeated multiple times)
         for (RequestParameter param : requestParameters) {
             if (Constants.TokenExchangeConstants.AUDIENCE.equals(param.getKey())) {
                 String[] values = param.getValue();
+                if (log.isDebugEnabled()) {
+                    log.debug("[TOKEN-EXCHANGE] Found audience parameter with " +
+                              (values != null ? values.length : 0) + " value(s): " +
+                              (values != null ? Arrays.toString(values) : "null"));
+                }
                 if (values != null) {
                     // Add all values from this audience parameter
+                    // Per RFC 8693, audience can be space-separated values
                     for (String value : values) {
                         if (value != null && !value.trim().isEmpty()) {
-                            audiences.add(value.trim());
-                            if (log.isDebugEnabled()) {
-                                log.debug("[TOKEN-EXCHANGE] Found requested audience: '" + value.trim() + "'");
+                            // Split by whitespace to handle space-separated audiences
+                            String[] splitValues = value.trim().split("\\s+");
+                            for (String splitValue : splitValues) {
+                                if (!splitValue.isEmpty() && !audiences.contains(splitValue)) {
+                                    audiences.add(splitValue);
+                                    if (log.isDebugEnabled()) {
+                                        log.debug("[TOKEN-EXCHANGE] Added requested audience: '" + splitValue + "'");
+                                    }
+                                }
                             }
                         }
                     }
@@ -904,6 +944,10 @@ public class TokenExchangeGrantHandler extends AbstractAuthorizationGrantHandler
             finalAudiences.addAll(requestedAudiences);
 
             tokReqMsgCtx.setAudiences(finalAudiences);
+
+            // Store the requested audiences as a property for use during token generation
+            // This will be checked in the issue() method to ensure only requested audiences are included
+            tokReqMsgCtx.addProperty("TOKEN_EXCHANGE_REQUESTED_AUDIENCES", finalAudiences);
 
             if (log.isDebugEnabled()) {
                 log.debug("[TOKEN-EXCHANGE] Successfully set audiences in token context: " + finalAudiences);
